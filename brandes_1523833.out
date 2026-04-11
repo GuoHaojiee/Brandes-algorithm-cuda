@@ -1,0 +1,65 @@
+Sender: LSF System <lsfadmin@polus-c2-ib.bmc.hpc.cs.msu.ru>
+Subject: Job 1523833: <brandes_test> in cluster <MSUCluster> Done
+
+Job <brandes_test> was submitted from host <polus-ib.bmc.hpc.cs.msu.ru> by user <edu-cmc-sqi23-01> in cluster <MSUCluster> at Sun Apr  5 19:28:26 2026
+Job was executed on host(s) <2*polus-c2-ib.bmc.hpc.cs.msu.ru>, in queue <short>, as user <edu-cmc-sqi23-01> in cluster <MSUCluster> at Sun Apr  5 19:28:27 2026
+</home_edu/edu-cmc-sqi23/edu-cmc-sqi23-01> was used as the home directory.
+</home_edu/edu-cmc-sqi23/edu-cmc-sqi23-01/Brandes-algorithm-cuda/2023-PLGP-BC> was used as the working directory.
+Started at Sun Apr  5 19:28:27 2026
+Terminated at Sun Apr  5 19:28:30 2026
+Results reported at Sun Apr  5 19:28:30 2026
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+#!/bin/bash
+#BSUB -J brandes_test
+#BSUB -W 00:30
+#BSUB -n 2
+#BSUB -R "span[ptile=2]"
+#BSUB -gpu "num=2:mode=shared"
+#BSUB -o brandes_%J.out
+#BSUB -e brandes_%J.err
+
+cd ~/Brandes-algorithm-cuda/2023-PLGP-BC
+
+module load SpectrumMPI
+
+mpiexec -n 2 ./solution_mpi -in rmat-12
+./validation -ans rmat-12.ans -res rmat-12.res
+
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   2.78 sec.
+    Max Memory :                                 7 MB
+    Average Memory :                             5.00 MB
+    Total Requested Memory :                     -
+    Delta Memory :                               -
+    Max Swap :                                   -
+    Max Processes :                              4
+    Max Threads :                                5
+    Run time :                                   7 sec.
+    Turnaround time :                            4 sec.
+
+The output (if any) follows:
+
+start algorithm...
+iter number = 0[MPI] 图组装通信时间: 0.0018 秒
+[GPU] 计算时间: 0.6645 秒
+[MPI] Allreduce 时间: 0.0003 秒
+ finished. Time is 0.66677 sec.
+algorithm iterations finished.
+rmat-12 vertices = 4096, edges = 131072, nIters = 1, time: min = 0.66677, avg = 0.66677, max = 0.66677
+Time = 0.66677 sec.
+[1;32mAccepted[0m
+
+
+PS:
+
+Read file <brandes_1523833.err> for stderr output of this job.
+
