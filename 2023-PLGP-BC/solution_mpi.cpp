@@ -72,9 +72,10 @@ void run(graph_t *G, double *result)
     vector<long long> go_sig(max_out);
 
     /* ---- GPU 输入缓冲（逐级复用）---- */
-    vector<int>       all_front   (loc_n);          /* 合并 frontier */
-    vector<int>       front_off   (BATCH_SIZE + 1); /* 分段偏移 */
-    vector<long long> front_sigma (loc_n);          /* 对应 sigma */
+    /* total_fz 最大 = BATCH_SIZE × loc_n，按批量大小分配 */
+    vector<int>       all_front   (BATCH_SIZE * loc_n);
+    vector<int>       front_off   (BATCH_SIZE + 1);
+    vector<long long> front_sigma (BATCH_SIZE * loc_n);
 
     /* ---- MPI 通信元数据（逐级复用）---- */
     vector<int> scnt(nproc), rcnt(nproc), sdisp(nproc+1), rdisp(nproc+1);

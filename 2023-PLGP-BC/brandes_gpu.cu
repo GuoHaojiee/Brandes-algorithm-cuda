@@ -105,9 +105,10 @@ extern "C" void bc_gpu_init(
 
     CUDA_CHECK(cudaMalloc(&s_d_offset,    (size_t)(local_n + 1)    * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s_d_dest,      (size_t)safe_m           * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&s_d_all_front, (size_t)local_n          * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&s_d_front_off, (size_t)(batch_size + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&s_d_front_sig, (size_t)local_n  * sizeof(long long)));
+    /* total_fz 最大 = batch_size × local_n，需按批量大小分配 */
+    CUDA_CHECK(cudaMalloc(&s_d_all_front, (size_t)batch_size * local_n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s_d_front_off, (size_t)(batch_size + 1)     * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&s_d_front_sig, (size_t)batch_size * local_n * sizeof(long long)));
     CUDA_CHECK(cudaMalloc(&s_d_out_b,     (size_t)max_out          * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s_d_out_src,   (size_t)max_out          * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s_d_out_dst,   (size_t)max_out          * sizeof(int)));
