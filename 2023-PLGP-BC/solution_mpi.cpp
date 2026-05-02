@@ -101,6 +101,8 @@ void run(graph_t *G, double *result)
                            : "DISABLED (blocking baseline)");
     }
 
+    for (int i = 0; i < loc_n; i++) result[i] = 0.0;
+
     /* 注册 MPI 数据类型 */
     MPI_Datatype mpi_fwd_t, mpi_bp_t;
     MPI_Type_contiguous(sizeof(FwdMsg), MPI_BYTE, &mpi_fwd_t);
