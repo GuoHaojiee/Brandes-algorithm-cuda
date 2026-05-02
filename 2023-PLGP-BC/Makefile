@@ -18,10 +18,6 @@ all: $(TARGET)
 solution_mpi: main_mpi.o solution_mpi.o rcm.o brandes_gpu.o graph_tools.o gen_RMAT_mpi.o gen_random_mpi.o
 	$(MPICXX) $^ -o $@ $(LDFLAGS) $(CUDA_LDFLAGS)
 
-# RCM / solution 的头文件依赖（改 rcm.h 时触发重编译）
-rcm.o: rcm.cpp rcm.h defs.h
-solution_mpi.o: solution_mpi.cpp rcm.h defs.h
-
 # CUDA kernel 编译规则（nvcc -arch=sm_60）
 brandes_gpu.o: brandes_gpu.cu
 	$(NVCC) $(CUDA_ARCH) -std=c++11 -O3 -c $< -o $@
