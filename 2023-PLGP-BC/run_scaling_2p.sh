@@ -11,11 +11,12 @@ cd ~/Brandes-algorithm-cuda/2023-PLGP-BC
 module load SpectrumMPI
 
 NPROC=2
-echo "=== 强可扩展性测试：nproc=${NPROC} ==="
-echo "图：rmat-14，开始时间：$(date)"
+echo "=== 强可扩展性：nproc=${NPROC} / 1 节点 ==="
+echo "图：rmat-14，开始：$(date)"
 
-mpiexec -n ${NPROC} ./solution_mpi -in rmat-14 -out rmat-14-${NPROC}p.res
+for i in 1 2 3; do
+    echo "--- Run $i ---"
+    mpiexec -n ${NPROC} ./solution_mpi -in rmat-14 -out rmat-14-${NPROC}p-r${i}.res
+done
 
 echo "SCALING nproc=${NPROC} graph=rmat-14 done at $(date)"
-
-echo "完成时间：$(date)"
