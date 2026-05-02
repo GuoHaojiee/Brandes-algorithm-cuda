@@ -1,6 +1,6 @@
 #!/bin/bash
 #BSUB -J bc_scale_4p
-#BSUB -W 01:00
+#BSUB -W 00:30
 #BSUB -n 4
 #BSUB -R "span[ptile=2]"
 #BSUB -gpu "num=2:mode=shared"
@@ -16,7 +16,7 @@ echo "图：rmat-14，开始：$(date)"
 
 for i in 1 2 3; do
     echo "--- Run $i ---"
-    mpiexec -n ${NPROC} ./solution_mpi -in rmat-14 -out rmat-14-${NPROC}p-r${i}.res
+    mpiexec -n ${NPROC} ./solution_mpi -in rmat-12 -out rmat-12-${NPROC}p-r${i}.res
 done
 
 echo "SCALING nproc=${NPROC} graph=rmat-14 done at $(date)"
