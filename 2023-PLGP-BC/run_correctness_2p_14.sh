@@ -14,7 +14,7 @@ module load SpectrumMPI
 echo "=== RCM 性能对比：4 进程 / 2 节点 / rmat-14 ==="
 echo "节点：$(hostname)，开始：$(date)"
 
-for run in 1 2 3; do
+for run in 1; do
   echo ""
   echo "============ Run $run ============"
   echo "--- identity ---"

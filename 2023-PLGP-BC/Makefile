@@ -15,7 +15,7 @@ TARGET = gen_valid_info validation gen_RMAT gen_random solution_mpi
 all: $(TARGET)
 
 # your own distributed implementation（加入 brandes_gpu.o 和 CUDA 链接）
-solution_mpi: main_mpi.o solution_mpi.o rcm.o brandes_gpu.o graph_tools.o gen_RMAT_mpi.o gen_random_mpi.o
+solution_mpi: main_mpi.o solution_mpi.o brandes_gpu.o graph_tools.o gen_RMAT_mpi.o gen_random_mpi.o
 	$(MPICXX) $^ -o $@ $(LDFLAGS) $(CUDA_LDFLAGS)
 
 # CUDA kernel 编译规则（nvcc -arch=sm_60）
