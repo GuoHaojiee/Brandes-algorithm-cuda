@@ -20,7 +20,7 @@ solution_mpi: main_mpi.o solution_mpi.o brandes_gpu.o graph_tools.o gen_RMAT_mpi
 
 # CUDA kernel 编译规则（nvcc -arch=sm_60）
 brandes_gpu.o: brandes_gpu.cu
-	$(NVCC) $(CUDA_ARCH) -O3 -c $< -o $@
+	$(NVCC) $(CUDA_ARCH) -std=c++11 -O3 -c $< -o $@
 
 # RMAT generator
 gen_RMAT: gen_RMAT.o graph_tools.o
