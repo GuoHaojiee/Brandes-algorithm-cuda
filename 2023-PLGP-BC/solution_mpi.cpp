@@ -257,7 +257,9 @@ void run(graph_t *G, double *result)
                     delta[v_lc] += (double)sigma[v_lc] * coeff;
 
                 /* 远程前驱：把贡献值发给 owner 进程 */
-                for (auto& [v_gl, sig_v] : remote_preds[w_lc]) {
+                for (int pi = 0; pi < (int)remote_preds[w_lc].size(); pi++) {
+                    int       v_gl  = remote_preds[w_lc][pi].first;
+                    long long sig_v = remote_preds[w_lc][pi].second;
                     int v_own = VERTEX_OWNER((vertex_id_t)v_gl, G->n, G->nproc);
                     bwd_vtx[v_own].push_back(v_gl);
                     bwd_val[v_own].push_back((double)sig_v * coeff);
