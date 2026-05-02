@@ -35,7 +35,7 @@ using std::max;
 } while (0)
 
 /* ---- persistent GPU state ---- */
-static int        s_n, s_m, s_bs;     /* local_n, local_m, batch_size */
+static int        s_n;                /* local_n */
 static int        s_v0, s_vend;       /* local vertex global range [v0, vend) */
 
 static int*       s_off;              /* CSR offset  [local_n+1]         */
@@ -118,7 +118,8 @@ __global__ void k_expand(
             int wlc = wg - v0;
             int old = atomicCAS(&dd[b * n + wlc], -1, lev + 1);
             if (old == -1 || old == lev + 1)
-                atomicAdd(&ds[b * n + wlc], sv);
+                atomicAdd((unsigned long long*)&ds[b * n + wlc],
+                          (unsigned long long)sv);
         } else {
             int pos = atomicAdd(cnt, 1);
             ob[pos] = b; ow[pos] = wg; os[pos] = sv;
@@ -138,7 +139,8 @@ __global__ void k_apply_fwd(
     long long sv = asig[i];
     int old = atomicCAS(&dd[b * n + wlc], -1, dlev);
     if (old == -1 || old == dlev)
-        atomicAdd(&ds[b * n + wlc], sv);
+        atomicAdd((unsigned long long*)&ds[b * n + wlc],
+                  (unsigned long long)sv);
 }
 
 /* Collect vertices at target level into per-batch slices of s_nv.
@@ -214,9 +216,7 @@ extern "C" void bc_gpu_init(
     int v0_global, int gpu_device)
 {
     CUDA_CHECK(cudaSetDevice(gpu_device));
-    s_n  = local_n;
-    s_m  = local_m;
-    s_bs = batch_size;
+    s_n    = local_n;
     s_v0   = v0_global;
     s_vend = v0_global + local_n;
 
