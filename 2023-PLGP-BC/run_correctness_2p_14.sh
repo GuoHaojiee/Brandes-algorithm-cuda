@@ -17,7 +17,7 @@ cd ~/Brandes-algorithm-cuda/2023-PLGP-BC
 module load SpectrumMPI
 
 GRAPH=rmat-14
-NREPS=2
+NREPS=1
 
 echo "============================================================"
 echo "  OVERLAP 性能对比：4 进程 / 2 独占节点 / $GRAPH / 各 $NREPS 次"
