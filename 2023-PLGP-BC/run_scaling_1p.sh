@@ -1,6 +1,6 @@
 #!/bin/bash
 #BSUB -J bc_scale_1p
-#BSUB -W 00:30
+#BSUB -W 01:00
 #BSUB -n 1
 #BSUB -R "span[ptile=2]"
 #BSUB -gpu "num=1:mode=shared"

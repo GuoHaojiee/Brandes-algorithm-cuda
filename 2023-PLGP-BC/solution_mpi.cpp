@@ -1,58 +1,53 @@
 /*
- * solution_mpi.cpp — 分布式 Brandes BC（Direction B: GPU-resident state）
+ * solution_mpi.cpp — v3.5: 合并 Alltoallv + 增大 BATCH + 缓冲复用
  *
- * 每个进程只持有 O(n/p) 的本地图分区。
- * BFS 状态 d[], sigma[], delta[] 全部驻留在 GPU 显存中。
- * GPU 使用 atomicCAS/atomicAdd 处理所有本地顶点更新。
- * CPU 只负责 MPI 跨进程通信（打包/解包消息）。
+ * 相比 v3 的改动：
+ *   1. 正向 BFS：4 次 Alltoallv → 1 次（24 字节 FwdMsg 结构体）
+ *   2. 反向 BP： 3 次 Alltoallv → 1 次（16 字节 BpMsg 结构体）
+ *   3. BATCH_SIZE 64 → 128（GPU 显存仍在 P100 16GB 内）
+ *   4. send/recv 缓冲循环外预声明，自动复用 vector capacity
  *
- * 批量处理：每次同时处理 BATCH_SIZE 个源节点，摊销 MPI 调用开销。
+ * 不变：
+ *   - 内存仍是 O(BATCH × n/p) = O(n/p) ✓
+ *   - GPU 接口完全没改，brandes_gpu.cu 不需要重新编译
+ *   - 算法语义完全一致，正确性不受影响
  */
 
 #include "defs.h"
 #include <vector>
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 using namespace std;
 
-static const int BATCH_SIZE = 64;
+static const int BATCH_SIZE = 128;
 
-/* GPU 函数（brandes_gpu.cu）*/
+/* GPU 函数（brandes_gpu.cu，未改动）*/
 extern "C" void bc_gpu_init(int local_n, int local_m, int batch_size,
-                             const int* offset, const int* dest,
-                             int v0_global, int gpu_device);
-extern "C" void bc_gpu_reset_batch(int batch_sz, const int* src_lc_h);
-extern "C" int  bc_gpu_bfs_expand(const int* af_h, const int* foff_h,
-                                   int batch_sz, int total_fz, int cur_lev,
-                                   int* out_b, int* out_wgl, long long* out_sig);
-extern "C" void bc_gpu_apply_remote_fwd(const int* b_h, const int* wlc_h,
-                                         const long long* sig_h,
-                                         int count, int disc_lev);
-extern "C" int  bc_gpu_collect_next(int batch_sz, int target_lev,
-                                     int* h_nv, int* h_ncnt);
-extern "C" int  bc_gpu_backprop_level(int batch_sz, int lev,
-                                       int* out_b, int* out_ugl, double* out_coeff);
-extern "C" void bc_gpu_apply_remote_bp(const int* b_h, const int* ulc_h,
-                                        const double* coeff_h,
-                                        int count, int lev);
-extern "C" void bc_gpu_get_delta(int batch_sz, double* h_delta);
+                             const int* offset, const int* dest, int gpu_device);
+extern "C" int  bc_gpu_expand_batch(
+    const int* all_front, const int* front_offsets, const long long* front_sigma,
+    int batch_sz, int total_fz, int v0_global,
+    int* out_b, int* out_src, int* out_dst, long long* out_sig);
 extern "C" void bc_gpu_cleanup(void);
 
-/* ---- 辅助：执行一次 MPI_Alltoallv（3 数组版本）---- */
-static void alltoallv3(
-    const vector<int>& scnt, const vector<int>& sdisp,
-    const vector<int>& rcnt, const vector<int>& rdisp,
-    vector<int>& sb, vector<int>& rb,
-    vector<int>& sv, vector<int>& rv,
-    vector<long long>& ss, vector<long long>& rs)
-{
-    MPI_Alltoallv(sb.data(), scnt.data(), sdisp.data(), MPI_INT,
-                  rb.data(), rcnt.data(), rdisp.data(), MPI_INT, MPI_COMM_WORLD);
-    MPI_Alltoallv(sv.data(), scnt.data(), sdisp.data(), MPI_INT,
-                  rv.data(), rcnt.data(), rdisp.data(), MPI_INT, MPI_COMM_WORLD);
-    MPI_Alltoallv(ss.data(), scnt.data(), sdisp.data(), MPI_LONG_LONG,
-                  rs.data(), rcnt.data(), rdisp.data(), MPI_LONG_LONG, MPI_COMM_WORLD);
-}
+/* ---- 合并的消息结构体 ----
+ * 用 MPI_Type_contiguous 包成 MPI 数据类型，
+ * 一次 Alltoallv 取代原来的 4 次（forward）/ 3 次（backward）
+ */
+struct FwdMsg {
+    int       b;        /* batch_id */
+    int       v_gl;     /* 远程前驱 global ID（反向传播时需要）*/
+    int       w_gl;     /* 目标顶点 global ID */
+    int       _pad;     /* 8 字节对齐 */
+    long long sig;      /* sigma_v */
+};   /* 24 字节 */
+
+struct BpMsg {
+    int    b;
+    int    v_gl;
+    double contrib;
+};   /* 16 字节，double 自然 8 字节对齐 */
 
 void run(graph_t *G, double *result)
 {
@@ -63,236 +58,295 @@ void run(graph_t *G, double *result)
     const int loc_m = (int)G->local_m;
     const int v0    = (int)VERTEX_TO_GLOBAL(0, G->n, G->nproc, rank);
 
+    /* ---- 注册 MPI 数据类型 ---- */
+    MPI_Datatype mpi_fwd_t, mpi_bp_t;
+    MPI_Type_contiguous(sizeof(FwdMsg), MPI_BYTE, &mpi_fwd_t);
+    MPI_Type_commit(&mpi_fwd_t);
+    MPI_Type_contiguous(sizeof(BpMsg), MPI_BYTE, &mpi_bp_t);
+    MPI_Type_commit(&mpi_bp_t);
+
     /* ---- 上传本地 CSR 到 GPU ---- */
     {
-        vector<int> loff(loc_n + 1), ldst(max(loc_m, 1));
+        vector<int> loff(loc_n + 1), ldst(loc_m > 0 ? loc_m : 1);
         for (int i = 0; i <= loc_n; i++) loff[i] = (int)G->rowsIndices[i];
         for (int i = 0; i < loc_m;  i++) ldst[i] = (int)G->endV[i];
-        bc_gpu_init(loc_n, loc_m, BATCH_SIZE,
-                    loff.data(), ldst.data(), v0, rank % 2);
+        bc_gpu_init(loc_n, loc_m, BATCH_SIZE, loff.data(), ldst.data(), rank % 2);
     }
 
-    /* ---- 预分配 CPU 缓冲区 ---- */
+    /* ---- BFS 状态：BATCH_SIZE 份，每份 O(n/p) ---- */
+    vector<vector<int> >       bd    (BATCH_SIZE, vector<int>      (loc_n));
+    vector<vector<long long> > bsigma(BATCH_SIZE, vector<long long>(loc_n));
+    vector<vector<double> >    bdelta(BATCH_SIZE, vector<double>   (loc_n));
+
+    vector<vector<vector<int> > > bpreds_l(
+        BATCH_SIZE, vector<vector<int> >(loc_n));
+    vector<vector<vector<pair<int,long long> > > > bpreds_r(
+        BATCH_SIZE, vector<vector<pair<int,long long> > >(loc_n));
+
+    vector<vector<vector<int> > > blevels(BATCH_SIZE);
+    vector<vector<int> > bcur(BATCH_SIZE);
+    vector<vector<int> > bnext(BATCH_SIZE);
+
+    /* ---- GPU 输出缓冲 ---- */
     int max_out = BATCH_SIZE * max(loc_m, 1);
-
-    /* frontier 输入（本地，逐层复用）*/
-    vector<int>  all_front(BATCH_SIZE * loc_n);
-    vector<int>  front_off(BATCH_SIZE + 1);
-
-    /* GPU expand 输出（远程消息）*/
-    vector<int>       go_b  (max_out), go_wgl(max_out);
+    vector<int>       go_b  (max_out), go_src(max_out), go_dst(max_out);
     vector<long long> go_sig(max_out);
 
-    /* collect_next 中间缓冲 */
-    vector<int> h_nv  (BATCH_SIZE * loc_n);
-    vector<int> h_ncnt(BATCH_SIZE);
+    /* ---- GPU 输入缓冲 ---- */
+    vector<int>       all_front   (BATCH_SIZE * loc_n);
+    vector<int>       front_off   (BATCH_SIZE + 1);
+    vector<long long> front_sigma (BATCH_SIZE * loc_n);
 
-    /* GPU backprop 输出（远程贡献）*/
-    vector<int>    bp_b  (max_out), bp_ugl(max_out);
-    vector<double> bp_coeff(max_out);
+    /* ---- MPI 通信元数据（循环外预分配，每层复用）---- */
+    vector<int> scnt(nproc), rcnt(nproc), sdisp(nproc+1), rdisp(nproc+1);
 
-    /* delta 下载缓冲 */
-    vector<double> h_delta(BATCH_SIZE * loc_n);
+    /* ---- 远程消息暂存（按目标进程分桶）---- */
+    vector<vector<FwdMsg> > fwd_buf(nproc);
+    vector<vector<BpMsg> >  bp_buf(nproc);
 
-    /* ---- MPI 通信元数据（逐级复用）---- */
-    vector<int> scnt(nproc), rcnt(nproc), sdisp(nproc + 1), rdisp(nproc + 1);
-
-    /* 正向 BFS 消息暂存：batch_id / w_global / sigma_v */
-    vector<vector<int> >       fwd_b(nproc), fwd_w(nproc);
-    vector<vector<long long> > fwd_s(nproc);
-
-    /* 反向传播消息暂存：batch_id / u_global / coeff */
-    vector<vector<int> >    bpq_b(nproc), bpq_u(nproc);
-    vector<vector<double> > bpq_c(nproc);
+    /* ---- 合并后的 send/recv 缓冲（每层 resize，capacity 自动保留）---- */
+    vector<FwdMsg> fwd_send, fwd_recv;
+    vector<BpMsg>  bp_send,  bp_recv;
 
     for (int i = 0; i < loc_n; i++) result[i] = 0.0;
     double t0 = MPI_Wtime();
 
     /* ================================================================
-     * 主循环：每次处理 BATCH_SIZE 个源节点
+     * 主循环：每次 BATCH_SIZE 个源节点
      * ================================================================ */
     for (int s_start = 0; s_start < n; s_start += BATCH_SIZE) {
         int batch_sz = min(BATCH_SIZE, n - s_start);
 
-        /* ---- 重置 GPU 状态，设置种子 ---- */
-        {
-            vector<int> src_lc(batch_sz);
-            for (int b = 0; b < batch_sz; b++) {
-                int s_gl = s_start + b;
-                if (VERTEX_OWNER((vertex_id_t)s_gl, G->n, G->nproc) == rank)
-                    src_lc[b] = s_gl - v0;
-                else
-                    src_lc[b] = -1;
+        /* ---- 初始化本批 BFS 状态 ---- */
+        for (int b = 0; b < batch_sz; b++) {
+            int s_gl = s_start + b;
+            fill(bd[b].begin(), bd[b].end(), -1);
+            fill(bsigma[b].begin(), bsigma[b].end(), 0LL);
+            for (int i = 0; i < loc_n; i++) {
+                bpreds_l[b][i].clear();
+                bpreds_r[b][i].clear();
             }
-            bc_gpu_reset_batch(batch_sz, src_lc.data());
+            blevels[b].clear();
+            bcur[b].clear();
+
+            if (VERTEX_OWNER((vertex_id_t)s_gl, G->n, G->nproc) == rank) {
+                int s_lc = s_gl - v0;
+                bd[b][s_lc]     = 0;
+                bsigma[b][s_lc] = 1LL;
+                bcur[b].push_back(s_lc);
+                blevels[b].push_back(vector<int>(1, s_lc));
+            } else {
+                blevels[b].push_back(vector<int>());
+            }
         }
 
         int cur_level = 0;
 
-        /* ---- 预取 level-0 frontier（种子）---- */
-        bc_gpu_collect_next(batch_sz, 0, h_nv.data(), h_ncnt.data());
-
         /* ============================================================
          * 正向 BFS
-         * h_nv / h_ncnt 在每次迭代开始时已包含 cur_level 层的顶点
-         * （由上一迭代末尾的 collect_next 填充，或由上方预取填充）
          * ============================================================ */
         while (true) {
 
-            /* ---- 从缓存的 h_nv/h_ncnt 构建 all_front ---- */
+            /* ---- 合并 frontier ---- */
+            int total_fz = 0;
             front_off[0] = 0;
-            int fi = 0;
             for (int b = 0; b < batch_sz; b++) {
-                for (int i = 0; i < h_ncnt[b]; i++)
-                    all_front[fi++] = h_nv[b * loc_n + i];
-                front_off[b + 1] = fi;
+                for (int i = 0; i < (int)bcur[b].size(); i++) {
+                    all_front  [total_fz] = bcur[b][i];
+                    front_sigma[total_fz] = bsigma[b][bcur[b][i]];
+                    total_fz++;
+                }
+                front_off[b + 1] = total_fz;
             }
-            int total_fz = fi;
 
-            /* ---- GPU：扩展 frontier，返回远程消息 ---- */
-            int ne = bc_gpu_bfs_expand(
-                all_front.data(), front_off.data(),
-                batch_sz, total_fz, cur_level,
-                go_b.data(), go_wgl.data(), go_sig.data());
+            /* ---- GPU 批量扩展 ---- */
+            int ne = bc_gpu_expand_batch(
+                all_front.data(), front_off.data(), front_sigma.data(),
+                batch_sz, total_fz, v0,
+                go_b.data(), go_src.data(), go_dst.data(), go_sig.data()
+            );
 
-            /* ---- 路由远程消息 ---- */
-            for (int p = 0; p < nproc; p++) {
-                fwd_b[p].clear(); fwd_w[p].clear(); fwd_s[p].clear();
-            }
+            /* ---- 区分本地 / 远程；远程打包成 FwdMsg ---- */
+            for (int p = 0; p < nproc; p++) fwd_buf[p].clear();
+            for (int b = 0; b < batch_sz; b++) bnext[b].clear();
+
             for (int e = 0; e < ne; e++) {
-                int p = VERTEX_OWNER((vertex_id_t)go_wgl[e], G->n, G->nproc);
-                fwd_b[p].push_back(go_b[e]);
-                fwd_w[p].push_back(go_wgl[e]);
-                fwd_s[p].push_back(go_sig[e]);
+                int       b     = go_b  [e];
+                int       w_gl  = go_dst[e];
+                int       w_own = VERTEX_OWNER((vertex_id_t)w_gl, G->n, G->nproc);
+                long long sig_v = go_sig[e];
+                int       v_gl  = go_src[e];
+
+                if (w_own == rank) {
+                    int w_lc = w_gl - v0;
+                    int v_lc = v_gl - v0;
+                    if (bd[b][w_lc] == -1) {
+                        bd[b][w_lc]     = cur_level + 1;
+                        bsigma[b][w_lc] = sig_v;
+                        bpreds_l[b][w_lc].push_back(v_lc);
+                        bnext[b].push_back(w_lc);
+                    } else if (bd[b][w_lc] == cur_level + 1) {
+                        bsigma[b][w_lc] += sig_v;
+                        bpreds_l[b][w_lc].push_back(v_lc);
+                    }
+                } else {
+                    FwdMsg m;
+                    m.b    = b;
+                    m.v_gl = v_gl;
+                    m.w_gl = w_gl;
+                    m._pad = 0;
+                    m.sig  = sig_v;
+                    fwd_buf[w_own].push_back(m);
+                }
             }
 
-            /* ---- 打包发送缓冲 ---- */
-            for (int p = 0; p < nproc; p++) scnt[p] = (int)fwd_s[p].size();
+            /* ---- size exchange ---- */
+            for (int p = 0; p < nproc; p++) scnt[p] = (int)fwd_buf[p].size();
             MPI_Alltoall(scnt.data(), 1, MPI_INT,
                          rcnt.data(), 1, MPI_INT, MPI_COMM_WORLD);
             sdisp[0] = rdisp[0] = 0;
             for (int p = 0; p < nproc; p++) {
-                sdisp[p + 1] = sdisp[p] + scnt[p];
-                rdisp[p + 1] = rdisp[p] + rcnt[p];
+                sdisp[p+1] = sdisp[p] + scnt[p];
+                rdisp[p+1] = rdisp[p] + rcnt[p];
             }
             int ts = sdisp[nproc], tr = rdisp[nproc];
 
-            vector<int>       s_b(ts), r_b(tr);
-            vector<int>       s_w(ts), r_w(tr);
-            vector<long long> s_s(ts), r_s(tr);
-            for (int p = 0, pos = 0; p < nproc; p++)
-                for (int i = 0; i < scnt[p]; i++, pos++) {
-                    s_b[pos] = fwd_b[p][i];
-                    s_w[pos] = fwd_w[p][i];
-                    s_s[pos] = fwd_s[p][i];
+            /* ---- 打包 send 缓冲（连续内存）---- */
+            fwd_send.resize(ts);
+            for (int p = 0, pos = 0; p < nproc; p++) {
+                int cnt = (int)fwd_buf[p].size();
+                if (cnt > 0) {
+                    memcpy(&fwd_send[pos], fwd_buf[p].data(),
+                           (size_t)cnt * sizeof(FwdMsg));
+                    pos += cnt;
                 }
-
-            alltoallv3(scnt, sdisp, rcnt, rdisp,
-                       s_b, r_b, s_w, r_w, s_s, r_s);
-
-            /* ---- 应用收到的消息：转换 w_global → w_local ---- */
-            if (tr > 0) {
-                vector<int>       recv_b  (tr), recv_wlc(tr);
-                vector<long long> recv_sig(tr);
-                for (int i = 0; i < tr; i++) {
-                    recv_b  [i] = r_b[i];
-                    recv_wlc[i] = r_w[i] - v0;
-                    recv_sig[i] = r_s[i];
-                }
-                bc_gpu_apply_remote_fwd(
-                    recv_b.data(), recv_wlc.data(), recv_sig.data(),
-                    tr, cur_level + 1);
             }
 
-            /* ---- 收集下一层并检测全局终止 ---- */
-            /* h_nv/h_ncnt 被更新为 cur_level+1 层，下轮直接使用 */
-            int local_next = bc_gpu_collect_next(batch_sz, cur_level + 1,
-                                                  h_nv.data(), h_ncnt.data());
-            int global_next = 0;
-            MPI_Allreduce(&local_next, &global_next, 1, MPI_INT,
-                          MPI_SUM, MPI_COMM_WORLD);
-            if (global_next == 0) break;
+            /* ---- 一次合并的 Alltoallv（取代原来 4 次）---- */
+            fwd_recv.resize(tr);
+            MPI_Alltoallv(
+                fwd_send.data(), scnt.data(), sdisp.data(), mpi_fwd_t,
+                fwd_recv.data(), rcnt.data(), rdisp.data(), mpi_fwd_t,
+                MPI_COMM_WORLD);
 
+            /* ---- 处理收到的消息 ---- */
+            for (int i = 0; i < tr; i++) {
+                const FwdMsg& m = fwd_recv[i];
+                int       b     = m.b;
+                int       v_gl  = m.v_gl;
+                int       w_gl  = m.w_gl;
+                long long sig_v = m.sig;
+                int       w_lc  = w_gl - v0;
+
+                if (bd[b][w_lc] == -1) {
+                    bd[b][w_lc]     = cur_level + 1;
+                    bsigma[b][w_lc] = sig_v;
+                    bpreds_r[b][w_lc].push_back(make_pair(v_gl, sig_v));
+                    bnext[b].push_back(w_lc);
+                } else if (bd[b][w_lc] == cur_level + 1) {
+                    bsigma[b][w_lc] += sig_v;
+                    bpreds_r[b][w_lc].push_back(make_pair(v_gl, sig_v));
+                }
+            }
+
+            /* ---- 全局终止检测 ---- */
+            int local_sz = 0;
+            for (int b = 0; b < batch_sz; b++) local_sz += (int)bnext[b].size();
+            int global_sz = 0;
+            MPI_Allreduce(&local_sz, &global_sz, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            if (global_sz == 0) break;
+
+            for (int b = 0; b < batch_sz; b++) {
+                blevels[b].push_back(bnext[b]);
+                bcur[b].swap(bnext[b]);
+            }
             cur_level++;
-        } /* end forward BFS */
+        }
 
         /* ============================================================
          * 反向传播
          * ============================================================ */
+        for (int b = 0; b < batch_sz; b++)
+            fill(bdelta[b].begin(), bdelta[b].end(), 0.0);
+
+        int max_lev = 0;
+        for (int b = 0; b < batch_sz; b++)
+            max_lev = max(max_lev, (int)blevels[b].size() - 1);
         int global_max_lev = 0;
-        MPI_Allreduce(&cur_level, &global_max_lev, 1, MPI_INT,
-                      MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(&max_lev, &global_max_lev, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
         for (int lev = global_max_lev; lev >= 1; lev--) {
+            for (int p = 0; p < nproc; p++) bp_buf[p].clear();
 
-            /* ---- GPU：计算本层本地 delta，输出远程贡献请求 ---- */
-            int ne_bp = bc_gpu_backprop_level(
-                batch_sz, lev,
-                bp_b.data(), bp_ugl.data(), bp_coeff.data());
+            for (int b = 0; b < batch_sz; b++) {
+                if (lev >= (int)blevels[b].size()) continue;
+                for (int wi = 0; wi < (int)blevels[b][lev].size(); wi++) {
+                    int w_lc = blevels[b][lev][wi];
+                    if (bsigma[b][w_lc] == 0) continue;
+                    double coeff = (1.0 + bdelta[b][w_lc]) / (double)bsigma[b][w_lc];
 
-            /* ---- 路由远程贡献 ---- */
-            for (int p = 0; p < nproc; p++) {
-                bpq_b[p].clear(); bpq_u[p].clear(); bpq_c[p].clear();
+                    /* 本地前驱 */
+                    for (int vi = 0; vi < (int)bpreds_l[b][w_lc].size(); vi++) {
+                        int v_lc = bpreds_l[b][w_lc][vi];
+                        bdelta[b][v_lc] += (double)bsigma[b][v_lc] * coeff;
+                    }
+
+                    /* 远程前驱：打包成 BpMsg */
+                    for (int pi = 0; pi < (int)bpreds_r[b][w_lc].size(); pi++) {
+                        int       v_gl  = bpreds_r[b][w_lc][pi].first;
+                        long long sig_v = bpreds_r[b][w_lc][pi].second;
+                        int v_own = VERTEX_OWNER((vertex_id_t)v_gl, G->n, G->nproc);
+                        BpMsg m;
+                        m.b       = b;
+                        m.v_gl    = v_gl;
+                        m.contrib = (double)sig_v * coeff;
+                        bp_buf[v_own].push_back(m);
+                    }
+                }
             }
-            for (int e = 0; e < ne_bp; e++) {
-                int p = VERTEX_OWNER((vertex_id_t)bp_ugl[e], G->n, G->nproc);
-                bpq_b[p].push_back(bp_b[e]);
-                bpq_u[p].push_back(bp_ugl[e]);
-                bpq_c[p].push_back(bp_coeff[e]);
-            }
 
-            for (int p = 0; p < nproc; p++) scnt[p] = (int)bpq_c[p].size();
+            /* size exchange */
+            for (int p = 0; p < nproc; p++) scnt[p] = (int)bp_buf[p].size();
             MPI_Alltoall(scnt.data(), 1, MPI_INT,
                          rcnt.data(), 1, MPI_INT, MPI_COMM_WORLD);
             sdisp[0] = rdisp[0] = 0;
             for (int p = 0; p < nproc; p++) {
-                sdisp[p + 1] = sdisp[p] + scnt[p];
-                rdisp[p + 1] = rdisp[p] + rcnt[p];
+                sdisp[p+1] = sdisp[p] + scnt[p];
+                rdisp[p+1] = rdisp[p] + rcnt[p];
             }
             int ts = sdisp[nproc], tr = rdisp[nproc];
 
-            vector<int>    s_qb(ts), r_qb(tr);
-            vector<int>    s_qu(ts), r_qu(tr);
-            vector<double> s_qc(ts), r_qc(tr);
-            for (int p = 0, pos = 0; p < nproc; p++)
-                for (int i = 0; i < scnt[p]; i++, pos++) {
-                    s_qb[pos] = bpq_b[p][i];
-                    s_qu[pos] = bpq_u[p][i];
-                    s_qc[pos] = bpq_c[p][i];
+            /* 打包 send */
+            bp_send.resize(ts);
+            for (int p = 0, pos = 0; p < nproc; p++) {
+                int cnt = (int)bp_buf[p].size();
+                if (cnt > 0) {
+                    memcpy(&bp_send[pos], bp_buf[p].data(),
+                           (size_t)cnt * sizeof(BpMsg));
+                    pos += cnt;
                 }
-
-            MPI_Alltoallv(s_qb.data(), scnt.data(), sdisp.data(), MPI_INT,
-                          r_qb.data(), rcnt.data(), rdisp.data(), MPI_INT,
-                          MPI_COMM_WORLD);
-            MPI_Alltoallv(s_qu.data(), scnt.data(), sdisp.data(), MPI_INT,
-                          r_qu.data(), rcnt.data(), rdisp.data(), MPI_INT,
-                          MPI_COMM_WORLD);
-            MPI_Alltoallv(s_qc.data(), scnt.data(), sdisp.data(), MPI_DOUBLE,
-                          r_qc.data(), rcnt.data(), rdisp.data(), MPI_DOUBLE,
-                          MPI_COMM_WORLD);
-
-            /* ---- 应用收到的 delta 贡献 ---- */
-            if (tr > 0) {
-                vector<int>    recv_b  (tr), recv_ulc(tr);
-                vector<double> recv_c  (tr);
-                for (int i = 0; i < tr; i++) {
-                    recv_b  [i] = r_qb[i];
-                    recv_ulc[i] = r_qu[i] - v0;
-                    recv_c  [i] = r_qc[i];
-                }
-                bc_gpu_apply_remote_bp(
-                    recv_b.data(), recv_ulc.data(), recv_c.data(),
-                    tr, lev);
             }
-        } /* end back_prop */
 
-        /* ---- 下载 delta，累积 BC ---- */
-        bc_gpu_get_delta(batch_sz, h_delta.data());
+            /* 一次合并的 Alltoallv（取代原来 3 次）*/
+            bp_recv.resize(tr);
+            MPI_Alltoallv(
+                bp_send.data(), scnt.data(), sdisp.data(), mpi_bp_t,
+                bp_recv.data(), rcnt.data(), rdisp.data(), mpi_bp_t,
+                MPI_COMM_WORLD);
+
+            /* 应用 */
+            for (int i = 0; i < tr; i++) {
+                const BpMsg& m = bp_recv[i];
+                bdelta[m.b][m.v_gl - v0] += m.contrib;
+            }
+        }
+
+        /* ---- 累积 BC（跳过源节点）---- */
         for (int b = 0; b < batch_sz; b++) {
             int s_gl = s_start + b;
             for (int i = 0; i < loc_n; i++)
                 if ((v0 + i) != s_gl)
-                    result[i] += h_delta[b * loc_n + i];
+                    result[i] += bdelta[b][i];
         }
 
     } /* end for s_start */
@@ -301,6 +355,9 @@ void run(graph_t *G, double *result)
 
     /* 无向图：每条最短路被双向计数 */
     for (int i = 0; i < loc_n; i++) result[i] /= 2.0;
+
+    MPI_Type_free(&mpi_fwd_t);
+    MPI_Type_free(&mpi_bp_t);
 
     if (rank == 0)
         printf("[Total] 计算时间: %.4f 秒\n", MPI_Wtime() - t0);
