@@ -1,6 +1,9 @@
 /*
  * brandes_gpu.cu — GPU 辅助：本地 CSR 上传 + 批量 frontier 边扩展
  *
+ * 与 v3.5 完全一致，v3.6 不需要重新编译此文件（接口未变）。
+ * 提供完整副本仅为方便部署。
+ *
  * bc_gpu_expand_batch：一次调用处理 batch_sz 个 BFS frontier，
  * 每个线程负责合并 frontier 中的一个顶点，输出 (b, v_global, w_global, sigma_v)。
  */
