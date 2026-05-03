@@ -3,6 +3,7 @@
 #BSUB -W 00:20
 #BSUB -n 2
 #BSUB -R "span[ptile=2]"
+#BSUB -m "polus-c3-ib polus-c4-ib"
 #BSUB -gpu "num=2:mode=shared"
 #BSUB -o correctness_2p_%J.out
 #BSUB -e correctness_2p_%J.err
