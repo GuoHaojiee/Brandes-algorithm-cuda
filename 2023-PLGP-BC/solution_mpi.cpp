@@ -1,5 +1,5 @@
 /*
- * solution_mpi.cpp — v3.7: v3.5 + MPI 通信-计算重叠
+ * solution_mpi.cpp — v3.7: v3.5 + MPI 通信-计算重叠 + 内存可扩展性测量
  *
  * 优化（教师列表第 1 项："Отправка и прием сообщений в разных программных потоках"）
  * ───────────────────────────────────────────────────────────────────────────
@@ -24,6 +24,8 @@
  *   - send/recv 缓冲循环外预声明
  *
  * 内存：严格 O(n/p)
+ * 运行结束时通过 /proc/self/status 读取 VmHWM (peak resident set size)，
+ * 用 MPI_Reduce 汇总到 rank 0 报告，证明每进程内存随 p 增加而下降。
  *
  * 用法：
  *   BC_USE_OVERLAP=1 mpiexec -n 4 ./solution_mpi ...   # 优化版
@@ -36,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <unistd.h>
 using namespace std;
 
 static const int BATCH_SIZE = 128;
@@ -83,6 +86,27 @@ struct LocalBp {             /* 反向传播：暂存本地前驱贡献 */
 static bool overlap_enabled_by_env() {
     const char* e = getenv("BC_USE_OVERLAP");
     return (e == NULL) || (e[0] != '0');
+}
+
+/* ─── Memory measurement helper ───
+ * Read a key (e.g. "VmHWM:" or "VmRSS:") from /proc/self/status, return
+ * the integer value in kB. Returns -1 on error. Linux-only; on POWER8
+ * Linux Red Hat 7.5 (Polus) this is fully supported.
+ */
+static long get_proc_status_kb(const char* key) {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long val = -1;
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) == 0) {
+            sscanf(line + klen, " %ld kB", &val);
+            break;
+        }
+    }
+    fclose(f);
+    return val;
 }
 
 void run(graph_t *G, double *result)
@@ -490,15 +514,41 @@ void run(graph_t *G, double *result)
 
     } /* end for s_start */
 
-    bc_gpu_cleanup();
+    double t_compute = MPI_Wtime() - t0;
 
     /* 无向图：每条最短路被双向计数。
      * 注意：覆盖式赋值给 result（不是 +=），与 v3.6 unpermute_result identity
      * 行为一致——这样不依赖 framework 是否清零 result。 */
     for (int i = 0; i < loc_n; i++) result[i] = bc[i] / 2.0;
 
-    if (rank == 0)
-        printf("[Total] 计算时间: %.4f 秒\n", MPI_Wtime() - t0);
+    /* ─── Memory scalability measurement ───
+     * VmHWM = peak resident set size since process start (high-water mark).
+     * Reading it BEFORE bc_gpu_cleanup() captures the true peak across
+     * computation + GPU host buffers + MPI buffers.
+     *
+     * If all per-process allocations are O(n/p) + O(m/p) (which they are
+     * in this implementation), per-process peak RSS should drop roughly
+     * proportionally as p grows — this is the memory scalability evidence
+     * required by the assignment.
+     */
+    long my_hwm_kb = get_proc_status_kb("VmHWM:");
+    long max_hwm = 0, sum_hwm = 0, min_hwm = 0;
+    MPI_Reduce(&my_hwm_kb, &max_hwm, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&my_hwm_kb, &sum_hwm, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&my_hwm_kb, &min_hwm, 1, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        printf("[Total] Computation time: %.4f sec\n", t_compute);
+        printf("[Memory] Per-process peak RSS: max=%.1f MB, min=%.1f MB, "
+               "avg=%.1f MB, total=%.1f MB across %d procs\n",
+               max_hwm / 1024.0,
+               min_hwm / 1024.0,
+               sum_hwm / (1024.0 * nproc),
+               sum_hwm / 1024.0,
+               nproc);
+    }
+
+    bc_gpu_cleanup();
 
     MPI_Type_free(&mpi_fwd_t);
     MPI_Type_free(&mpi_bp_t);
