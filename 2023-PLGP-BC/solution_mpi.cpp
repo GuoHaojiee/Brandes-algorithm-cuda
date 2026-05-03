@@ -101,7 +101,9 @@ void run(graph_t *G, double *result)
                            : "DISABLED (blocking baseline)");
     }
 
-    for (int i = 0; i < loc_n; i++) result[i] = 0.0;
+    /* 用本地数组累积 BC（与 v3.6 identity 模式等价），最后一次性覆盖写入
+     * result。这样无论 framework 传入的 result 起点如何、是否多次调用
+     * run() 共享同一 result，都能保证正确。 */
 
     /* 注册 MPI 数据类型 */
     MPI_Datatype mpi_fwd_t, mpi_bp_t;
@@ -158,6 +160,9 @@ void run(graph_t *G, double *result)
     /* 重叠模式下：本地工作的暂存 buffer */
     vector<LocalEdge> local_edges;   /* 正向 BFS 用 */
     vector<LocalBp>   local_bps;     /* 反向传播用 */
+
+    /* 本地 BC 累积器（v3.6 identity 风格，最后一次性覆盖 result） */
+    vector<double> bc(loc_n, 0.0);
 
     double t0 = MPI_Wtime();
 
@@ -464,20 +469,22 @@ void run(graph_t *G, double *result)
             }
         }
 
-        /* 累积到 result */
+        /* 累积到本地 bc */
         for (int b = 0; b < batch_sz; b++) {
             int s_gl = s_start + b;
             for (int i = 0; i < loc_n; i++)
                 if ((v0 + i) != s_gl)
-                    result[i] += bdelta[b][i];
+                    bc[i] += bdelta[b][i];
         }
 
     } /* end for s_start */
 
     bc_gpu_cleanup();
 
-    /* 无向图：每条最短路被双向计数 */
-    for (int i = 0; i < loc_n; i++) result[i] /= 2.0;
+    /* 无向图：每条最短路被双向计数。
+     * 注意：覆盖式赋值给 result（不是 +=），与 v3.6 unpermute_result identity
+     * 行为一致——这样不依赖 framework 是否清零 result。 */
+    for (int i = 0; i < loc_n; i++) result[i] = bc[i] / 2.0;
 
     if (rank == 0)
         printf("[Total] 计算时间: %.4f 秒\n", MPI_Wtime() - t0);
